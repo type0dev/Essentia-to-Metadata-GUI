@@ -234,6 +234,8 @@ The library browser **auto-detects your folder structure** — it works with:
 
 If your files have no tags yet (you're about to tag them), the browser falls back to parsing folder names to populate Artist and Album. After tagging, hit **Refresh** and it will update from the written tags.
 
+> ⚠️ **Known limitation:** If your files are flat (no subfolders) and untagged, with artist/album info only in the filename (e.g. `2pac-better-dayz-01-intro.mp3`), the library browser cannot parse this and will group everything under `(unknown artist)`. The tagger will still process and tag all files correctly — after tagging, hit Refresh and the browser will populate from the written tags.
+
 ### Tagger tab
 
 | Setting | Description |
