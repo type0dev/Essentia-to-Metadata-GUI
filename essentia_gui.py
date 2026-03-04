@@ -16,6 +16,7 @@ import os
 import queue
 import re
 import urllib.request
+import json
 
 try:
     from mutagen import File as MutagenFile
@@ -48,11 +49,13 @@ MONO       = ("Monospace", 9)
 AUDIO_EXTS = {".flac", ".mp3", ".ogg", ".opus", ".m4a", ".aac",
               ".wav", ".wv", ".ape"}
 
-HERE       = os.path.dirname(os.path.abspath(__file__))
+HERE        = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR  = os.path.join(HERE, "models")
 LOGS_DIR    = os.path.join(HERE, "logs")
 TAGGER_LOGS = os.path.join(LOGS_DIR, "tagger")
 GUI_LOGS    = os.path.join(LOGS_DIR, "gui")
+CACHE_FILE    = os.path.join(HERE, "tagged_cache.json")
+SETTINGS_FILE = os.path.join(HERE, "gui_settings.json")
 
 REQUIRED_MODELS = [
     {
@@ -156,6 +159,114 @@ def find_script():
 
 def is_audio(name):
     return os.path.splitext(name)[1].lower() in AUDIO_EXTS
+
+
+# ── Tag cache helpers ──────────────────────────────────────────────────────────
+def cache_load():
+    """Load the tagged-files cache. Returns dict of {filepath: mtime}."""
+    try:
+        if os.path.isfile(CACHE_FILE):
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def cache_save(data):
+    """Persist the cache dict to disk."""
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+def cache_update(music_folder):
+    """
+    Walk music_folder and add any audio files that now have genre or mood tags
+    to the cache, keyed by filepath with their current mtime as value.
+    Removes entries for files that no longer exist.
+    Called automatically after a successful tagger run.
+    """
+    if not HAS_MUTAGEN or not music_folder or not os.path.isdir(music_folder):
+        return
+    data = cache_load()
+    # Prune missing files
+    data = {k: v for k, v in data.items() if os.path.isfile(k)}
+    for root, dirs, files in os.walk(music_folder):
+        dirs.sort()
+        for fname in files:
+            if not is_audio(fname):
+                continue
+            fp = os.path.join(root, fname)
+            try:
+                mtime = os.path.getmtime(fp)
+                # Only cache files that actually have tags written
+                f = MutagenFile(fp, easy=True)
+                if f and f.tags:
+                    has_genre = bool(f.tags.get("genre"))
+                    has_mood  = bool(f.tags.get("mood"))
+                    if has_genre or has_mood:
+                        data[fp] = mtime
+            except Exception:
+                pass
+    cache_save(data)
+    return data
+
+def cache_needs_tagging(music_folder):
+    """
+    Return list of file paths in music_folder that are NOT in the cache
+    or whose mtime has changed since they were cached (i.e. file was modified).
+    """
+    data  = cache_load()
+    needs = []
+    for root, dirs, files in os.walk(music_folder):
+        dirs.sort()
+        for fname in sorted(files):
+            if not is_audio(fname):
+                continue
+            fp = os.path.join(root, fname)
+            try:
+                mtime = os.path.getmtime(fp)
+                cached_mtime = data.get(fp)
+                if cached_mtime is None or abs(mtime - cached_mtime) > 1:
+                    needs.append(fp)
+            except Exception:
+                needs.append(fp)
+    return needs
+
+
+# ── Settings helpers ───────────────────────────────────────────────────────────
+_SETTINGS_DEFAULTS = {
+    "music_dir":    "",
+    "script":       "",
+    "genres":       3,
+    "genre_thresh": 15.0,
+    "mood_thresh":  0.5,
+    "genre_format": "parent_child",
+    "mood":         True,
+    "use_gpu":      False,
+    "gpu_index":    "0",
+    "write_mode":   "dry",
+}
+
+def settings_load():
+    """Load saved settings, returning defaults for any missing keys."""
+    data = dict(_SETTINGS_DEFAULTS)
+    try:
+        if os.path.isfile(SETTINGS_FILE):
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data.update(json.load(f))
+    except Exception:
+        pass
+    return data
+
+def settings_save(data):
+    """Persist settings dict to disk."""
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
 
 
 # Friendly ID3 frame name mapping
@@ -667,19 +778,21 @@ class App(tk.Tk):
         self.configure(bg=BG)
 
         # ── state vars ─────────────────────────────────────────────────────
-        self.v_script       = tk.StringVar(value=find_script())
-        self.v_music_dir    = tk.StringVar(value="")
+        _s = settings_load()
+        self.v_script       = tk.StringVar(value=_s.get("script") or find_script())
+        self.v_music_dir    = tk.StringVar(value=_s.get("music_dir", ""))
         self.v_single_file  = tk.StringVar(value="")
         self.v_single       = tk.BooleanVar(value=False)
         self.v_dry_run      = tk.BooleanVar(value=True)
         self.v_overwrite    = tk.BooleanVar(value=False)
-        self.v_mood         = tk.BooleanVar(value=True)
-        self.v_genres       = tk.IntVar(value=3)
-        self.v_genre_thresh = tk.DoubleVar(value=15.0)
-        self.v_mood_thresh  = tk.DoubleVar(value=0.5)
-        self.v_format       = tk.StringVar(value="parent_child")
-        self.v_use_gpu      = tk.BooleanVar(value=False)
-        self.v_gpu_index    = tk.StringVar(value="0")
+        self.v_mood         = tk.BooleanVar(value=_s.get("mood", True))
+        self.v_genres       = tk.IntVar(value=_s.get("genres", 3))
+        self.v_genre_thresh = tk.DoubleVar(value=_s.get("genre_thresh", 15.0))
+        self.v_mood_thresh  = tk.DoubleVar(value=_s.get("mood_thresh", 0.5))
+        self.v_format       = tk.StringVar(value=_s.get("genre_format", "parent_child"))
+        self.v_use_gpu      = tk.BooleanVar(value=_s.get("use_gpu", False))
+        self.v_gpu_index    = tk.StringVar(value=_s.get("gpu_index", "0"))
+        self._write_mode_init = _s.get("write_mode", "dry")
 
         self._proc           = None
         self._log_q          = queue.Queue()
@@ -687,6 +800,7 @@ class App(tk.Tk):
         self._lib            = {}
         self._track_files    = []
         self._detected_gpus  = []
+        self._cache          = cache_load()
 
         self._build()
         self._poll()
@@ -698,6 +812,25 @@ class App(tk.Tk):
 
         self.after(300,  self._check_models)
         self.after(800,  self._auto_detect_gpu)
+        if self.v_music_dir.get().strip():
+            self.after(1200, self._scan)
+
+    # ── settings ───────────────────────────────────────────────────────────
+    def _save_settings(self):
+        settings_save({
+            "music_dir":    self.v_music_dir.get(),
+            "script":       self.v_script.get(),
+            "genres":       self.v_genres.get(),
+            "genre_thresh": self.v_genre_thresh.get(),
+            "mood_thresh":  self.v_mood_thresh.get(),
+            "genre_format": self.v_format.get(),
+            "mood":         self.v_mood.get(),
+            "use_gpu":      self.v_use_gpu.get(),
+            "gpu_index":    self.v_gpu_index.get(),
+            "write_mode":   self.v_write_mode.get(),
+        })
+        self.status_var.set("✅  Settings saved")
+        self.after(2000, lambda: self.status_var.set("Ready"))
 
     # ── startup ────────────────────────────────────────────────────────────
     def _check_models(self):
@@ -1242,7 +1375,7 @@ class App(tk.Tk):
         opts = tk.Frame(card, bg=CARD)
         opts.grid(row=31, column=0, columnspan=3, sticky="w")
         # Radio-style write mode: clicking one instantly selects it
-        self.v_write_mode = tk.StringVar(value="dry")
+        self.v_write_mode = tk.StringVar(value=getattr(self, "_write_mode_init", "dry"))
 
         def _on_mode(*_):
             m = self.v_write_mode.get()
@@ -1258,6 +1391,8 @@ class App(tk.Tk):
              "Write genre/mood tags only to files that don't already have them."),
             ("🔁  Overwrite — write tags, replace existing ones", "overwrite",
              "Re-tag all files, replacing any existing genre or mood tags."),
+            ("⚡  Smart skip — only process new/changed files", "smart",
+             "Uses a local cache to skip files already tagged in a previous run. Only processes new or modified files."),
         ]:
             rb = tk.Radiobutton(opts, text=text, variable=self.v_write_mode,
                                 value=val, bg=CARD, fg=TEXT, selectcolor=BG,
@@ -1373,6 +1508,20 @@ class App(tk.Tk):
         self.v_gpu_index.trace_add("write", _update_badge)
         _update_badge()
 
+        # ── Save Settings button ─────────────────────────────────────────
+        tk.Frame(card, bg=BORDER, height=1).grid(
+            row=49, column=0, columnspan=3, sticky="ew", pady=8)
+        save_row = tk.Frame(card, bg=CARD)
+        save_row.grid(row=50, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        FlatBtn(save_row, text="💾  Save Settings",
+                command=self._save_settings,
+                color=ACCENT, hover=ACCENT_H,
+                padx=14, pady=6).pack(side="left")
+        tk.Label(save_row,
+                 text="Saves all settings above + music folder as defaults on next launch",
+                 bg=CARD, fg=SUBTEXT, font=FONT_SMALL
+                 ).pack(side="left", padx=(12, 0))
+
     def _run_card(self, parent):
         rf = tk.Frame(parent, bg=BG)
         rf.pack(fill="x")
@@ -1390,9 +1539,21 @@ class App(tk.Tk):
         self.btn_stop.pack(side="left", padx=(10, 0))
         self.btn_stop.config(state="disabled")
 
-        self.progress = ttk.Progressbar(rf, mode="indeterminate",
-                                        length=160)
+        self.progress = ttk.Progressbar(rf, mode="determinate",
+                                        length=280, maximum=100, value=0)
         self.progress.pack(side="left", padx=(14, 0))
+
+        # ETA label
+        self.eta_var = tk.StringVar(value="")
+        tk.Label(rf, textvariable=self.eta_var,
+                 bg=BG, fg=SUBTEXT, font=FONT_SMALL,
+                 width=30, anchor="w"
+                 ).pack(side="left", padx=(10, 0))
+
+        # Internal ETA tracking state
+        self._progress_start_time = None
+        self._progress_current    = 0
+        self._progress_total      = 0
 
     def _log_card(self, parent):
         hdr = tk.Frame(parent, bg=BG)
@@ -1492,6 +1653,35 @@ class App(tk.Tk):
 
     # ── Start / Stop ───────────────────────────────────────────────────────
     def _start(self):
+        # Smart skip: pre-filter files before launching tagger
+        if (self.v_write_mode.get() == "smart"
+                and not self.v_single.get()):
+            music_folder = self.v_music_dir.get().strip()
+            if not music_folder or not os.path.isdir(music_folder):
+                self._append("[ERROR] Please set a valid music folder.\n", "err")
+                return
+            self._append("⚡  Smart skip — scanning cache…\n", "gpu")
+            self.update_idletasks()
+            needs = cache_needs_tagging(music_folder)
+            total = sum(1 for r, d, fs in os.walk(music_folder)
+                        for f in fs if is_audio(f))
+            skip_count = total - len(needs)
+            if not needs:
+                self._append(
+                    f"✅  All {total} files already tagged — nothing to do.\n"
+                    "    Add new music and re-run, or use Overwrite mode.\n", "ok")
+                return
+            self._append(
+                f"  {skip_count} file(s) skipped (cached)  —  "
+                f"{len(needs)} file(s) to process\n", "dim")
+            # Run tagger once per file (single-file mode)
+            self._smart_queue  = list(needs)
+            self._smart_total  = len(needs)
+            self._smart_done   = 0
+            self._smart_folder = music_folder
+            self._start_smart_next()
+            return
+
         cmd, env, err = self._build_cmd()
         if err:
             self._append(f"[ERROR] {err}\n", "err")
@@ -1500,7 +1690,11 @@ class App(tk.Tk):
         self._running = True
         self.btn_run.config(state="disabled")
         self.btn_stop.config(state="normal")
-        self.progress.start(12)
+        self.progress["value"] = 0
+        self.eta_var.set("")
+        self._progress_start_time = None
+        self._progress_current = 0
+        self._progress_total = 0
 
         if self.v_use_gpu.get():
             idx      = env["CUDA_VISIBLE_DEVICES"]
@@ -1544,7 +1738,6 @@ class App(tk.Tk):
                 if "GPU_OK:" in out:
                     gpu_info = out.split("GPU_OK:", 1)[1].strip()
                     self._append(f"✅  GPU confirmed via nvidia-smi: {gpu_info}\n", "ok")
-                    # Now check if CUDA libs loaded OK
                     cuda_check = subprocess.check_output(
                         [sys.executable, "-c",
                          "import ctypes; ctypes.CDLL('libcudart.so.11.0'); print('CUDART_OK')"],
@@ -1557,6 +1750,90 @@ class App(tk.Tk):
             except Exception as e:
                 self._append(f"⚠  GPU probe failed: {e}\n", "warn")
 
+        self._launch_proc(cmd, env)
+
+    def _start_smart_next(self):
+        """Launch tagger for the next file in the smart skip queue."""
+        if not self._smart_queue or not self._running and self._smart_done > 0:
+            # All done
+            self._append(
+                f"\n✅  Smart skip complete — "
+                f"{self._smart_done}/{self._smart_total} file(s) tagged\n", "ok")
+            self.btn_run.config(state="normal")
+            self.btn_stop.config(state="disabled")
+            self.progress["value"] = 100
+            self.eta_var.set("")
+            self.status_var.set("Done")
+            # Update cache
+            threading.Thread(
+                target=lambda: cache_update(self._smart_folder),
+                daemon=True).start()
+            self.after(500, self._scan)
+            return
+
+        if not self._running and self._smart_done == 0:
+            # First file — set up UI
+            self._running = True
+            self.btn_run.config(state="disabled")
+            self.btn_stop.config(state="normal")
+            self.progress["value"] = 0
+            self.eta_var.set("")
+            self._progress_start_time = None
+            self._progress_current = 0
+            self._progress_total = 0
+            from datetime import datetime as _dt
+            _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+            self._gui_log_path = os.path.join(GUI_LOGS, f"gui_session_{_ts}.log")
+            self._gui_log_file = open(self._gui_log_path, "w", encoding="utf-8")
+
+        filepath = self._smart_queue.pop(0)
+        self._smart_done += 1
+        self.status_var.set(
+            f"Smart skip [{self._smart_done}/{self._smart_total}]…")
+
+        # Build cmd for single file, overwrite so tags get written
+        script = self.v_script.get().strip()
+        cmd = [sys.executable, script, filepath, "--auto",
+               "--genres",          str(self.v_genres.get()),
+               "--genre-threshold", str(int(self.v_genre_thresh.get())),
+               "--mood-threshold",  str(self.v_mood_thresh.get()),
+               "--genre-format",    self.v_format.get(),
+               "--model-dir",       MODELS_DIR,
+               "--log-dir",         TAGGER_LOGS,
+               "--overwrite",
+               "--single-file"]
+        if not self.v_mood.get():
+            cmd.append("--no-moods")
+
+        _, env, err = self._build_cmd()
+        if err:
+            self._append(f"[ERROR] {err}\n", "err")
+            return
+
+        def worker():
+            try:
+                self._proc = subprocess.Popen(
+                    args=cmd, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True, bufsize=1, env=env,
+                    start_new_session=True)
+                for line in iter(self._proc.stdout.readline, ""):
+                    if not self._running:
+                        break
+                    if "No network created" in line or "last created network" in line:
+                        continue
+                    self._log_q.put(line)
+                self._proc.wait()
+            except Exception as ex:
+                self._log_q.put(f"[ERROR] {ex}\n")
+            finally:
+                # Schedule next file
+                self.after(0, self._start_smart_next)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _launch_proc(self, cmd, env):
+        """Launch tag_music.py as a subprocess and stream output to the log."""
         def worker():
             try:
                 self._proc = subprocess.Popen(
@@ -1568,10 +1845,8 @@ class App(tk.Tk):
                 for line in iter(self._proc.stdout.readline, ""):
                     if not self._running:
                         break
-                    # Suppress noisy Essentia internal warnings
                     if "No network created" in line or "last created network" in line:
                         continue
-                    # Track current file progress
                     m = re.search(r"\[(\d+)/(\d+)\]", line)
                     if m:
                         _current_track[0] = f"[{m.group(1)}/{m.group(2)}]"
@@ -1579,10 +1854,10 @@ class App(tk.Tk):
                                    self.status_var.set(f"Running tagger… {t}"))
                     self._log_q.put(line)
                 self._proc.wait()
-                rc = self._proc.returncode
-                msg = f"\n✅  Finished (exit {rc})\n" if rc == 0 else f"\n⚠️   Exit code {rc}\n"
+                rc  = self._proc.returncode
+                msg = (f"\n✅  Finished (exit {rc})\n" if rc == 0
+                       else f"\n⚠️   Exit code {rc}\n")
                 self._log_q.put(msg)
-                # Close GUI log
                 if hasattr(self, "_gui_log_file") and self._gui_log_file and not self._gui_log_file.closed:
                     try:
                         self._gui_log_file.write(msg)
@@ -1616,7 +1891,8 @@ class App(tk.Tk):
             self._append("\n[Stopped by user]\n", "warn")
         self.btn_run.config(state="normal")
         self.btn_stop.config(state="disabled")
-        self.progress.stop()
+        self.progress["value"] = 0
+        self.eta_var.set("")
         self.status_var.set("Stopped")
 
     # ── Poll log queue ─────────────────────────────────────────────────────
@@ -1629,8 +1905,15 @@ class App(tk.Tk):
                     self._running = False
                     self.btn_run.config(state="normal")
                     self.btn_stop.config(state="disabled")
-                    self.progress.stop()
+                    self.progress["value"] = 100
+                    self.eta_var.set("")
                     self.status_var.set("Done")
+                    # Update tag cache after any successful run
+                    music_folder = self.v_music_dir.get().strip()
+                    if music_folder and os.path.isdir(music_folder):
+                        threading.Thread(
+                            target=lambda: cache_update(music_folder),
+                            daemon=True).start()
                     self.after(500, self._scan)
                     break
                 else:
@@ -1641,6 +1924,39 @@ class App(tk.Tk):
 
     # ── Log helpers ────────────────────────────────────────────────────────
     _ANSI = re.compile(r'\x1b\[[0-9;]*m')
+
+    def _update_progress(self, current, total):
+        """Update progress bar value and ETA label based on track counts."""
+        import time
+        if total <= 0:
+            return
+        now = time.monotonic()
+        if self._progress_start_time is None or current <= self._progress_current:
+            if self._progress_start_time is None:
+                self._progress_start_time = now
+            self._progress_current = current
+        else:
+            self._progress_current = current
+
+        pct = min(100.0, (current / total) * 100)
+        self.progress["value"] = pct
+
+        elapsed = now - self._progress_start_time
+        if current > 0 and elapsed > 2:
+            rate        = current / elapsed          # tracks/sec
+            remaining   = (total - current) / rate   # seconds left
+            mins, secs  = divmod(int(remaining), 60)
+            hrs, mins   = divmod(mins, 60)
+            if hrs > 0:
+                eta_str = f"{hrs}h {mins}m remaining"
+            elif mins > 0:
+                eta_str = f"{mins}m {secs}s remaining"
+            else:
+                eta_str = f"{secs}s remaining"
+            speed_str = f"{rate:.1f} tr/s" if rate >= 1 else f"{1/rate:.0f}s/tr"
+            self.eta_var.set(f"{pct:.0f}%  {eta_str}  ({speed_str})")
+        else:
+            self.eta_var.set(f"{pct:.0f}%  calculating…")
 
     def _classify(self, line):
         l = line.lower()
@@ -1657,7 +1973,12 @@ class App(tk.Tk):
         return None
 
     def _append_line(self, raw):
-        self._append(self._ANSI.sub("", raw), self._classify(raw))
+        clean = self._ANSI.sub("", raw)
+        # Update progress bar whenever we see [current/total]
+        m = re.search(r'\[(\d+)/(\d+)\]', clean)
+        if m:
+            self._update_progress(int(m.group(1)), int(m.group(2)))
+        self._append(clean, self._classify(raw))
 
     def _append(self, text, tag=None):
         self.log.config(state="normal")

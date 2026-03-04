@@ -250,7 +250,14 @@ If your files have no tags yet (you're about to tag them), the browser falls bac
 | Dry run | Preview only — nothing is written |
 | Normal | Write tags, skip already-tagged files |
 | Overwrite | Write tags, replace existing ones |
+| Smart skip | Only processes new or modified files using a local cache — ideal for incremental runs after adding new music |
 | GPU / CPU | Which compute device to use |
+
+#### 💾 Save Settings
+Click **Save Settings** at the bottom of the configuration panel to persist all settings (music folder, thresholds, GPU choice, write mode etc.) to `gui_settings.json` next to the script. These are automatically restored on next launch, including the last used music library which loads automatically on startup.
+
+#### ⚡ Smart Skip
+Smart skip builds a local cache file (`tagged_cache.json`) recording which files have been tagged and their modification timestamps. On subsequent runs only new or modified files are processed — the ML models are never loaded for already-tagged files, saving significant time on large libraries. The cache updates automatically after every run.
 
 ### Genre formats
 
